@@ -1,0 +1,244 @@
+{
+  "info": {
+    "cities": {
+      "address": 33816537,
+      "type": "|u1"
+    },
+    "factories": {
+      "address": 33816536,
+      "type": "|u1"
+    },
+    "funds": {
+      "address": 33816524,
+      "type": "<u4"
+    },
+    "vs_funds": {
+      "address": 33816528,
+      "type": "<u4"
+    },
+    "day": {
+      "address": 50395632,
+      "type": "|u1"
+    },
+    "turn": {
+      "address": 50388364,
+      "type": "|u1"
+    },
+    "cursor_x": {
+      "address": 33829295,
+      "type": "|u1"
+    },
+    "cursor_y": {
+      "address": 33829296,
+      "type": "|u1"
+    },
+    "nb_infantry": {
+      "address": 33816463,
+      "type": "|u1"
+    },
+    "nb_infantry_lost": {
+      "address": 33816520,
+      "type": "|u1"
+    },
+    "nb_mech": {
+      "address": 33816464,
+      "type": "|u1"
+    },
+    "nb_mech_lost": {
+      "address": 33816521,
+      "type": "|u1"
+    },
+    "nb_md_tank": {
+      "address": 33816465,
+      "type": "|u1"
+    },
+    "nb_md_tank_lost": {
+      "address": 33816522,
+      "type": "|u1"
+    },
+    "nb_tank": {
+      "address": 33816467,
+      "type": "|u1"
+    },
+    "nb_tank_lost": {
+      "address": 33816524,
+      "type": "|u1"
+    },
+    "nb_recon": {
+      "address": 33816468,
+      "type": "|u1"
+    },
+    "nb_recon_lost": {
+      "address": 33816525,
+      "type": "|u1"
+    },
+    "nb_apc": {
+      "address": 33816469,
+      "type": "|u1"
+    },
+    "nb_apc_lost": {
+      "address": 33816526,
+      "type": "|u1"
+    },
+    "nb_artlry": {
+      "address": 33816472,
+      "type": "|u1"
+    },
+    "nb_artlry_lost": {
+      "address": 33816529,
+      "type": "|u1"
+    },
+    "nb_rockets": {
+      "address": 33816473,
+      "type": "|u1"
+    },
+    "nb_rockets_lost": {
+      "address": 33816530,
+      "type": "|u1"
+    },
+    "nb_a_air": {
+      "address": 33816476,
+      "type": "|u1"
+    },
+    "nb_b_cptr": {
+      "address": 33816481,
+      "type": "|u1"
+    },
+    "nb_b_ship": {
+      "address": 33816483,
+      "type": "|u1"
+    },
+    "nb_cruiser": {
+      "address": 33816484,
+      "type": "|u1"
+    },
+    "nb_lander": {
+      "address": 33816485,
+      "type": "|u1"
+    },
+    "nb_sub": {
+      "address": 33816486,
+      "type": "|u1"
+    },
+    "nb_sub_lost": {
+      "address": 33816511,
+      "type": "|u1"
+    },
+    "nb_missiles_lost": {
+      "address": 33816502,
+      "type": "|u1"
+    },
+    "vs_nb_infantry": {
+      "address": 33816583,
+      "type": "|u1"
+    },
+    "vs_nb_infantry_lost": {
+      "address": 33816524,
+      "type": "|u1"
+    },
+    "vs_nb_mech": {
+      "address": 33816584,
+      "type": "|u1"
+    },
+    "vs_nb_mech_lost": {
+      "address": 33816525,
+      "type": "|u1"
+    },
+    "vs_nb_md_tank": {
+      "address": 33816585,
+      "type": "|u1"
+    },
+    "vs_nb_md_tank_lost": {
+      "address": 33816526,
+      "type": "|u1"
+    },
+    "vs_nb_tank": {
+      "address": 33816587,
+      "type": "|u1"
+    },
+    "vs_nb_tank_lost": {
+      "address": 33816528,
+      "type": "|u1"
+    },
+    "vs_nb_recon": {
+      "address": 33816588,
+      "type": "|u1"
+    },
+    "vs_nb_recon_lost": {
+      "address": 33816529,
+      "type": "|u1"
+    },
+    "vs_nb_apc": {
+      "address": 33816589,
+      "type": "|u1"
+    },
+    "vs_nb_apc_lost": {
+      "address": 33816530,
+      "type": "|u1"
+    },
+    "vs_nb_artlry": {
+      "address": 33816592,
+      "type": "|u1"
+    },
+    "vs_nb_artlry_lost": {
+      "address": 33816533,
+      "type": "|u1"
+    },
+    "vs_nb_rockets": {
+      "address": 33816593,
+      "type": "|u1"
+    },
+    "vs_nb_rockets_lost": {
+      "address": 33816534,
+      "type": "|u1"
+    },
+    "vs_nb_a_air": {
+      "address": 33816596,
+      "type": "|u1"
+    },
+    "vs_nb_b_cptr": {
+      "address": 33816601,
+      "type": "|u1"
+    },
+    "vs_nb_t_cptr_lost": {
+      "address": 33816625,
+      "type": "|u1"
+    },
+    "vs_nb_b_ship": {
+      "address": 33816603,
+      "type": "|u1"
+    },
+    "vs_nb_cruiser": {
+      "address": 33816604,
+      "type": "|u1"
+    },
+    "vs_nb_lander": {
+      "address": 33816605,
+      "type": "|u1"
+    },
+    "vs_nb_sub": {
+      "address": 33816606,
+      "type": "|u1"
+    },
+    "vs_nb_sub_lost": {
+      "address": 33816647,
+      "type": "|u1"
+    },
+    "vs_nb_missiles_lost": {
+      "address": 33816638,
+      "type": "|u1"
+    }
+  },
+  "map_width": {
+    "address": 33810704,
+    "type": "|u1"
+  },
+  "map_height": {
+    "address": 33810706,
+    "type": "|u1"
+  },
+  "map": {
+    "address": 33813250,
+    "type": "|u1"
+  }
+}
