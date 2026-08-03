@@ -1,25 +1,19 @@
 import time
-import os
+import json
 import numpy as np
 import matplotlib.pyplot as plt
-from actionwrapper import AWActionWrapper
-from pygba import PyGBA, PyGBAEnv
+import socket
+import struct
+import torch
+import sys
 
 # -----------------------------
 # CONSTANTS
 # -----------------------------
-MAP_DIM_ADDR = 0x0201E450
-MAP_DATA_ADDR = 0x0201F882
 FOG_ADDR = 0x0202079A
 DAY_ADDR = 0x03004420
-CURSOR_ADDR = 0x030033f0
 UNIT_P1 = 0x02022690
 UNIT_P2 = 0x02022990
-
-YIELD = 0x020232F0
-
-NB_UNITS_P1 = 0x020232FA
-NB_UNITS_LOST_P1 = 0x020232FB
 
 TERRAIN_COLORS = {
     0: (0, 0, 0),           # Empty / default
@@ -111,70 +105,85 @@ FACILITIES_NAMES = [
     "ports",
     "airports",
 ]
+with open("./data/data.json", "r") as file:
+    INFO_DICT = json.load(file)
 
 # -----------------------------
 # UTILS
 # -----------------------------
-def read_bytes_from_blocks(addr, size, blocks, retries=3, delay=0.001):
+def read_bytes_from_memory(addr, size, ewram, iwram, retries=3, delay=0.001):
     """
-    Read `size` bytes safely from memory.blocks.
+    Read `size` bytes safely from EWRAM/IWRAM tensors.
     Retry if the read fails.
 
     Args:
         addr (int): starting memory address
         size (int): number of bytes to read
-        blocks (dict): memory blocks from the emulator
+        ewram (torch.Tensor): EWRAM snapshot tensor (0x40000 bytes)
+        iwram (torch.Tensor): IWRAM snapshot tensor (0x8000 bytes)
         retries (int): number of retries if read fails
-        delay (float): delay (in seconds) between retries
+        delay (float): delay between retries
+
     Returns:
         bytes or None if all retries fail
     """
-    for attempt in range(retries):
-        out = bytearray()
-        remaining = size
-        current_addr = addr
-        while remaining > 0:
-            found = False
-            for block_base, data in blocks.items():
-                block_size = len(data)
-                if block_base <= current_addr < block_base + block_size:
-                    start = current_addr - block_base
-                    chunk_size = min(remaining, block_size - start)
-                    out += data[start:start + chunk_size]
-                    current_addr += chunk_size
-                    remaining -= chunk_size
-                    found = True
-                    break
-            if not found:
-                # Failed to read this chunk
-                break
-        if len(out) == size:
-            return bytes(out)
-        else:
-            time.sleep(delay)  # wait a bit before retrying
-    # All retries failed
-    return None
+    for _ in range(retries):
+        try:
+            out = bytearray()
+            current_addr = addr
+            remaining = size
 
-def safe_read(addr, size, blocks, retries=3):
+            while remaining > 0:
+                if 0x02000000 <= current_addr < 0x02000000 + 0x40000:
+                    # EWRAM
+                    offset = current_addr - 0x02000000
+                    available = 0x40000 - offset
+                    chunk_size = min(remaining, available)
+                    chunk = ewram[offset:offset + chunk_size]
+
+                elif 0x03000000 <= current_addr < 0x03000000 + 0x8000:
+                    # IWRAM
+                    offset = current_addr - 0x03000000
+                    available = 0x8000 - offset
+                    chunk_size = min(remaining, available)
+                    chunk = iwram[offset:offset + chunk_size]
+
+                else:
+                    raise ValueError(f"Address out of range: {hex(current_addr)}")
+
+                # Convert normalized tensor values back to bytes
+                out.extend(chunk.byte().cpu().numpy().tobytes())
+
+                current_addr += chunk_size
+                remaining -= chunk_size
+
+            return bytes(out)
+
+        except Exception:
+            time.sleep(delay)
+
+    return bytes(0)
+
+def safe_read(addr, size, ewram, iwram, retries=3):
     """Read integer safely from memory blocks."""
     for _ in range(retries):
-        b = read_bytes_from_blocks(addr, size, blocks)
+        b = read_bytes_from_memory(addr, size, ewram, iwram)
         if b is not None and len(b) == size:
             return int.from_bytes(b, "little")
-    return None
+    return -1
 
-def read_unit_from_info(blocks, address):
+def read_unit_from_info(ewram, iwram, address):
     """Read a unit field by field using memory blocks."""
     unit = {}
-    unit['x'] = safe_read(address, 1, blocks, retries=3)
-    unit['y'] = safe_read(address + 1, 1, blocks, retries=3)
-    unit['id'] = safe_read(address - 2, 1, blocks, retries=3)
-    unit["moved"] = safe_read(address - 1, 1, blocks, retries=3)
-    hp_ammo = safe_read(address + 2, 1, blocks, retries=3)
+    unit['id'] = safe_read(address, 1, ewram, iwram, retries=3)
+    unit["moved"] = safe_read(address + 1, 1, ewram, iwram, retries=3)
+    unit['x'] = safe_read(address + 2, 1, ewram, iwram, retries=3)
+    unit['y'] = safe_read(address + 3, 1, ewram, iwram, retries=3)
+    hp_ammo = safe_read(address + 4, 1, ewram, iwram, retries=3)
     unit['hp'] = hp_ammo if hp_ammo < 128 else hp_ammo - 128
     unit['ammo'] = 0 if hp_ammo < 128 else 1
-    unit['ammo'] += (safe_read(address + 3, 1, blocks, retries=3) % 8) * 2
-    unit['fuel'] = safe_read(address + 4, 1, blocks, retries=3)
+    unit['ammo'] += (safe_read(address + 5, 1, ewram, iwram, retries=3) % 8) * 2
+    unit['fuel'] = safe_read(address + 6, 1, ewram, iwram, retries=3)
     return unit
 
 # -----------------------------
@@ -183,54 +192,61 @@ def read_unit_from_info(blocks, address):
 class AdvanceWarsEnv:
     """Class wrapper for Advance Wars using Retro with step/render/reset functions."""
 
-    def __init__(self, rom_path="./roms/integration"):
+    def __init__(self):
         # -----------------------------
         # Initialize Retro environment
         # -----------------------------
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.conn = None
         self.terrain = None
         self.reward_history = [0.0]
+        self.ewram = torch.zeros(0x40000)
+        self.iwram = torch.zeros(0x8000)
+        self.info = {}
 
-        rom_path = "/home/yro/code/rom/AW2.gba"
-        self.gba = PyGBA.load(rom_path, autoload_save=True)
-        self.env = PyGBAEnv(self.gba)
-        self.wrapped = AWActionWrapper(self.env)
-        _, info = self.reset()
+        self.fog_mask = None
 
+        self.units_p1 = []
+        self.units_p1_count = {}
+        # self.units_p1_count_lost = {}
+
+        self.units_p2 = []
+        self.units_p2_count = {}
+        # self.units_p2_count_lost = {}
 
         # -----------------------------
         # Initialize Matplotlib figure
         # -----------------------------
         plt.ion()
-        self.fig, self.axes = plt.subplots(2, 4, figsize=(20, 5))
+        self.fig, self.axes = plt.subplots(2, 2, figsize=(10, 5))
         self.axes = self.axes.flatten()
-        self.axes[0].set_title("Game")
-        self.axes[1].set_title("Terrain")
-        self.axes[2].set_title("Fog")
-        self.axes[3].set_title("Units")
+        self.axes[0].set_title("Terrain")
+        self.axes[1].set_title("Fog")
+        self.axes[2].set_title("Units")
         for ax in self.axes:
             ax.axis("off")
 
-        self.axes[4].axis("on")
-
-        frame = self.env.render()
-        self.game_img = self.axes[0].imshow(frame)
+        self.axes[3].axis("on")
 
         # Initialize empty images for updating
         self.height, self.width = 20, 30
-        self.terrain_img = self.axes[1].imshow(np.zeros((self.height, self.width, 3), dtype=np.uint8))
-        self.fog_img = self.axes[2].imshow(np.zeros((self.height, self.width, 3), dtype=np.uint8))
-        self.units_img = self.axes[3].imshow(np.zeros((self.height, self.width, 3), dtype=np.uint8))
+        self.terrain_img = self.axes[0].imshow(np.zeros((self.height, self.width, 3), dtype=np.uint8))
+        self.fog_img = self.axes[1].imshow(np.zeros((self.height, self.width, 3), dtype=np.uint8))
+        self.units_img = self.axes[2].imshow(np.zeros((self.height, self.width, 3), dtype=np.uint8))
 
-        self.axes[4].set_title("Reward over Time")
-        self.axes[4].set_xlabel("Step")
-        self.axes[4].set_ylabel("Reward")
-        self.axes[4].grid(True)
-        self.axes[4].tick_params(axis='both', which='both', direction='in', top=True, right=True)
-        self.axes[4].set_xlim(0, 100)  # initial x-axis
-        self.axes[4].set_ylim(-10, 10)  # initial y-axis, adjust to expected reward range
-        self.reward_line, = self.axes[4].plot([], [], lw=2, color='orange')
+        self.axes[3].set_title("Reward over Time")
+        self.axes[3].set_xlabel("Step")
+        self.axes[3].set_ylabel("Reward")
+        self.axes[3].grid(True)
+        self.axes[3].tick_params(axis='both', which='both', direction='in', top=True, right=True)
+        self.axes[3].set_xlim(0, 100)  # initial x-axis
+        self.axes[3].set_ylim(-10, 10)  # initial y-axis, adjust to expected reward range
+        self.reward_line, = self.axes[3].plot([], [], lw=2, color='orange')
 
-        self.funds = info.get("funds", 0)
+        self.fig.canvas.draw_idle()
+        plt.pause(0.01)
+
+        self.funds = self.info.get("funds", 0)
 
         # Initialize dicts to calculate rewards
         self.losses = {}
@@ -239,51 +255,53 @@ class AdvanceWarsEnv:
 
         self.builds = {}
         for build_name in BUILDS_NAMES:
-            self.builds[build_name] = info.get(build_name, 0)
+            self.builds[build_name] = self.info.get(build_name, 0)
 
         self.facilities = {}
         for facility_name in FACILITIES_NAMES:
-            self.facilities[facility_name] = info.get(facility_name, 0)
+            self.facilities[facility_name] = self.info.get(facility_name, 0)
 
         self.vs_losses = {}
         for vs_loss_name in VS_LOSSES_NAMES:
-            self.vs_losses[vs_loss_name] = info.get(vs_loss_name, 0)
+            self.vs_losses[vs_loss_name] = self.info.get(vs_loss_name, 0)
 
         self.units_p1 = None
 
         self.turn_steps = 0.0
 
     def reset(self):
-        """Reset the Retro environment."""
-        self.obs = self.env.reset()
+        reset_sig = "RESET".encode(encoding="utf-8")
+        print(reset_sig)
+        self.conn.send(reset_sig)
+        time.sleep(1)  # Sleep a bit for at least 1 frame to pass
+        action = torch.zeros(10, dtype=torch.float32)
+        action = action.numpy().tobytes()
+        self.send_and_receive(action)
+        self.update_info()
         self.reward_history = [0.0]
-        self.units_p1 = None
-        _, _, done, _, info = self.wrapped.step(3) # Press UP -> no impact on game
-        fog, units_p1, units_p2 = self.extract_state()
-        terrain = self.terrain
+        self.render()
 
-        map_grid = self.encode_map(terrain, fog)
-        units_grid = self.make_units_grid(units_p1, units_p2)
+        map_grid = self.encode_map(self.terrain, self.fog_mask)
+        units_grid = self.make_units_grid(self.units_p1, self.units_p2)
 
-        extras = np.array([info.get("funds",0)], dtype=np.float32)
+        extras = np.array([self.info.get("funds",0)], dtype=np.float32)
 
         obs = {
             "map": map_grid,
             "units": units_grid,
             "extras": extras
         }
-        self.env.reset()
-        return obs, info
+        return obs, self.info
 
-    def read_map(self, height, width, blocks):
+    def read_map(self, height, width, ewram, iwram):
         # -----------------------------
         # Read tiles and fog
         # -----------------------------
         tiles = np.zeros((20, 30), dtype=np.uint8)
-        addr = MAP_DATA_ADDR
+        addr = INFO_DICT["map"]["address"]
         for y in range(height):
             for x in range(width):
-                b = read_bytes_from_blocks(addr, 2, blocks)
+                b = read_bytes_from_memory(addr, 2, ewram, iwram)
                 if b:
                     # 1st byte
                     # Bit 0: ???
@@ -323,6 +341,10 @@ class AdvanceWarsEnv:
                         tiles[y, x] = 10
                     elif not bit_7 and not bit_6 and not bit_3 and not bit_2 and not bit_1 and bit_0 and not cities:
                         tiles[y, x] = 4
+                    elif not bit_3 and bit_2 and bit_1 and not bit_0 and cities:
+                        tiles[y, x] = 16
+                    elif not bit_2 and bit_1 and bit_0 and cities:
+                        tiles[y, x] = 17
                     elif (bit_3 and not bit_2 and bit_1 and bit_0) or (bit_3 and not bit_2 and not bit_1 and bit_0) or (bit_3 and not bit_2 and not bit_1 and not bit_0):
                         tiles[y, x] = 6
                     elif bit_7 and bit_6 and not bit_5 and not bit_4 and not bit_3 and not bit_2 and bit_1 and not bit_0 and cities:
@@ -349,10 +371,6 @@ class AdvanceWarsEnv:
                         tiles[y, x] = 4
                     elif not bit_7 and not bit_6 and not bit_5 and bit_4 and not bit_3 and bit_2 and not bit_1 and not bit_0:
                         tiles[y, x] = 4
-                    elif not bit_3 and bit_2 and bit_1 and not bit_0:
-                        tiles[y, x] = 16
-                    elif bit_3 and bit_2 and bit_1 and not bit_0 and cities:
-                        tiles[y, x] = 17
                     elif bit_7 and bit_6 and bit_5 and not bit_4 and not bit_3 and not bit_2 and not bit_1 and bit_0:
                         tiles[y, x] = 3
                     elif not bit_7 and not bit_6 and bit_5 and not bit_4 and bit_3 and not bit_2 and bit_1 and not bit_0:
@@ -383,30 +401,35 @@ class AdvanceWarsEnv:
                         tiles[y, x] = 6
                     else:
                         tiles[y, x] = (b[0] >> 4) & 0b1111
-                    # tiles[y, x] = bit_4
+                    # tiles[y, x] = not bit_2 and bit_1 and bit_0 and cities
                 addr += 2
 
         return tiles
 
+    def update_info(self):
+        for k, v in INFO_DICT.items():
+            address = v["address"]
+            size = v["size"]
+            # print(k, address)
+            bytes = read_bytes_from_memory(address, size, self.ewram, self.iwram)
+            self.info[k] = int.from_bytes(bytes, byteorder="little") if bytes else 0
 
     def extract_state(self):
         """Extract map tiles, fog mask, and units from memory blocks."""
-        blocks = self.env.data.memory.blocks
 
         # -----------------------------
         # Read map dimensions
         # -----------------------------
-        dim_bytes = read_bytes_from_blocks(MAP_DIM_ADDR, 4, blocks)
-        width = int.from_bytes(dim_bytes[0:2], "little")
-        height = int.from_bytes(dim_bytes[2:4], "little")
+        width = self.info["map_width"]
+        height = self.info["map_height"]
 
-        self.terrain = self.read_map(height, width, blocks)
+        self.terrain = self.read_map(height, width, self.ewram, self.iwram)
 
         fog_mask = np.zeros((20, 30), dtype=np.uint8)
         fog_addr = FOG_ADDR
         for y in range(height):
             for x in range(width):
-                f = read_bytes_from_blocks(fog_addr,1, blocks)
+                f = read_bytes_from_memory(fog_addr,1, self.ewram, self.iwram)
                 if f:
                     fog_mask[y, x] =  1 if f[0] > 0 else 0
                 fog_addr += 1
@@ -416,33 +439,38 @@ class AdvanceWarsEnv:
         # Read units for player 1
         # -----------------------------
         units_p1 = []
-        unit = read_unit_from_info(blocks, UNIT_P1)
+        self.units_p1_count = {k: 0 for k in range(1,20)}  # Regroup units by ID
+        unit = read_unit_from_info(self.ewram, self.iwram, UNIT_P1)
         unit['ai'] = 0
         index = 0
-        while unit['id'] != 0 and UNIT_P1 + index * 0xc < UNIT_P2:
-            units_p1.append({**unit})
+        while UNIT_P1 + index * 12 < UNIT_P2:  # 12 -> Size of unit in memory
+            if unit["id"] != 0:
+                units_p1.append({**unit})
+                self.units_p1_count[unit["id"]] += 1
             index += 1
-            unit = read_unit_from_info(blocks, UNIT_P1 + index * 0xc)
+            unit = read_unit_from_info(self.ewram, self.iwram, UNIT_P1 + index * 12)
             unit['ai'] = 0
 
-        if self.units_p1 is None:
-            self.units_p1 = units_p1
 
         # -----------------------------
         # Read units for player 2
         # -----------------------------
         units_p2 = []
-        unit = read_unit_from_info(blocks, UNIT_P2)
+        self.units_p2_count = {k: 0 for k in range(1,20)}  # Regroup units by ID
+        unit = read_unit_from_info(self.ewram, self.iwram, UNIT_P2)
         unit['ai'] = 1
         index = 0
-        while unit['id'] != 0:
-            units_p2.append({**unit})
+        while UNIT_P2 + index * 12 < UNIT_P2 + 512:  # 512 -> Total bytes for a player's units
+            if unit["id"] != 0:
+                units_p2.append({**unit})
+                self.units_p2_count[unit["id"]] += 1
             index += 1
-            unit = read_unit_from_info(blocks, UNIT_P2 + index * 0xc)
+            unit = read_unit_from_info(self.ewram, self.iwram, UNIT_P2 + index * 12)
             unit['ai'] = 1
 
-
-        return fog_mask, units_p1, units_p2
+        self.fog_mask = fog_mask
+        self.units_p1 = units_p1
+        self.units_p2 = units_p2
 
     def encode_map(self, terrain, fog):
         # terrain, fog: numpy arrays (H, W)
@@ -451,7 +479,8 @@ class AdvanceWarsEnv:
 
     def render(self):
         """Render the map, fog, units, and reward using matplotlib."""
-        fog_mask, units_p1, units_p2 = self.extract_state()
+        self.extract_state()
+        fog_mask, units_p1, units_p2 = self.fog_mask, self.units_p1, self.units_p2
         tiles = self.terrain
 
         # Update terrain, fog, units (same as before)
@@ -470,9 +499,6 @@ class AdvanceWarsEnv:
             if 0 <= px < width and 0 <= py < height:
                 units_map[py, px] = ARMY_COLORS.get(u["ai"], (255, 255, 255))
 
-        frame = self.env.render()
-
-        self.game_img.set_data(frame)
         self.terrain_img.set_data(terrain)
         self.fog_img.set_data(fog)
         self.units_img.set_data(units_map)
@@ -483,15 +509,16 @@ class AdvanceWarsEnv:
         self.reward_line.set_data(range(len(self.reward_history)), self.reward_history)
 
         # Update axes limits dynamically
-        self.axes[4].set_xlim(0, max(100, len(self.reward_history)))
+        self.axes[3].set_xlim(0, max(100, len(self.reward_history)))
         current_min = min(self.reward_history) - 1
         current_max = max(self.reward_history) + 1
-        self.axes[4].set_ylim(current_min, current_max)
+        self.axes[3].set_ylim(current_min, current_max)
 
-        self.axes[4].relim()
-        self.axes[4].autoscale_view()
+        self.axes[3].relim()
+        self.axes[3].autoscale_view()
 
         self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
         plt.pause(0.001)
 
     def make_units_grid(self, units_p1, units_p2):
@@ -559,41 +586,83 @@ class AdvanceWarsEnv:
     def check_win(self):
         if len(self.units_p1) == 0:
             return False
+        
+    def send_and_receive(self, action):
+        self.conn.send(action)
+        # Receive 8-byte header
+        header = recv_exact(self.conn, 8)
+        if not header:
+            return None
 
+        length, frame = struct.unpack(">II", header)
+        data = recv_exact(self.conn, length)
+        if not data:
+            return None
+
+        if frame == WIN_FRAME:
+            # This is a win message
+            try:
+                msg = data.decode("ascii")
+                print(msg)
+                self.reset()
+            except UnicodeDecodeError:
+                return "[WIN] Unable to decode message"
+        elif frame == EXIT_FRAME:
+            # This is an exit message
+            try:
+                msg = data.decode("ascii")
+                print(msg)
+                self.reset()
+            except UnicodeDecodeError:
+                return "[EXIT] Unable to decode message"
+        else:
+            print("mem snapshot")
+            # This is a memory snapshot
+            mem = mem = np.frombuffer(data, dtype=np.uint8)
+            tensor = torch.from_numpy(mem)
+
+            self.ewram = tensor[:0x40000]
+            self.iwram = tensor[0x40000:]
 
     def step(self, action=None):
         """Step forward in the game using a given action or random action."""
         start = time.time()
         done = False
         if action is None:
-            action = self.wrapped.action_space.sample()
-        _, _, _, _, info = self.wrapped.step(action)
-        if info.get("turn", 0) != 1:
+            action = torch.zeros(10, dtype=torch.float32)
+            pos = np.random.randint(10)
+            while pos == 7 or pos == 6 or pos == 1: # NO start, select or R
+                pos = np.random.randint(10)
+            action[pos] = 1.0
+            action = action.numpy().tobytes()
+        self.send_and_receive(action)
+        self.update_info()
+        print(self.info)
+        self.render()
+        if self.info.get("turn", 0) != 1:
             self.turn_steps = 0.0
         else:
             self.turn_steps += 1.0
-
-        while info.get("turn", -1) != 1:
-            for _ in range(10):
-                _, _, _, _, info = self.wrapped.step(3)  # Press UP -> no impact on game
-            if info.get("finish", 0) == 5:
+        while self.info.get("turn", -1) != 1:
+            if self.info.get("finish", 0) == 5:
                 done = True
-            if info.get("turn", 0) == 1:
-                action_start = np.zeros(12, dtype=np.int8)
-                action_start[3] = 1
-                for _ in range(5):
-                    self.wrapped.step(action_start)
+            action_start = torch.zeros(10, dtype=torch.float32)
+            action_start = action_start.numpy().tobytes()
+            self.send_and_receive(action_start)
+            self.update_info()
+            self.render()
+            time.sleep(2)
 
-        if info.get("menu", 0) == 0 or info.get("win", 0) == 1:
+        if self.info.get("menu", 0) == 0 or self.info.get("win", 0) == 1:
             done = True
 
-        fog, units_p1, units_p2 = self.extract_state()
+        fog_mask, units_p1, units_p2 = self.fog_mask, self.units_p1, self.units_p2
         terrain = self.terrain
 
-        map_grid = self.encode_map(terrain, fog)
+        map_grid = self.encode_map(terrain, fog_mask)
         units_grid = self.make_units_grid(units_p1, units_p2)
 
-        extras = np.array([info.get("funds",0)], dtype=np.float32)
+        extras = np.array([self.info.get("funds",0)], dtype=np.float32)
 
         obs = {
             "map": map_grid,
@@ -601,7 +670,7 @@ class AdvanceWarsEnv:
             "extras": extras
         }
 
-        reward = self.calculatereward(info, units_p1)
+        reward = self.calculatereward(self.info, units_p1)
 
         self.reward_history.append(reward)
 
@@ -610,32 +679,55 @@ class AdvanceWarsEnv:
         if elapsed <  elapsed:
             time.sleep(frame_duration - elapsed)
 
-        return obs, reward, done, info
+        return obs, reward, done, self.info
 
     def close(self):
         """Close the environment and matplotlib figure."""
-        self.env.close()
         plt.close(self.fig)
+        self.socket.close()
+        sys.exit(1)
 
 # -----------------------------
 # USAGE EXAMPLE
 # -----------------------------
+HOST, PORT = "127.0.0.1", 5000
+WIN_FRAME = 0xFFFFFFFF  # Special frame indicating a win message
+EXIT_FRAME = 0x11111111
+
+def recv_exact(sock, size):
+    buf = b""
+
+    while len(buf) < size:
+        try:
+            data = sock.recv(size - len(buf))
+        except BlockingIOError:
+            # No more data available right now.
+            return None
+
+        if not data:
+            return None  # Connection closed
+
+        buf += data
+
+    return buf
+
 if __name__ == "__main__":
     env = AdvanceWarsEnv()
-    print("Press SPACE + Enter to step, 'q' to quit.")
 
-    while True:
-        key = input("Step? [space/q]: ")
-        if key.lower() == "q":
-            break
+    with env.socket as s:
+        try:
+            s.bind((HOST, PORT))
+            s.listen(1)
+            print(f"Listening on {HOST}:{PORT}...")
+            conn, addr = s.accept()
+            conn.setblocking(False)
+            print(f"Connected by {addr}")
 
-        # Step with random action
-        obs, reward, done, info = env.step()
-        env.render()
-
-        # Reset environment when done
-        if done:
-            print("Episode finished, resetting...")
-            env.reset()
-
-    env.close()
+            with conn:
+                env.conn = conn
+                while env:
+                    env.close()
+                    env.step()
+            env.close()
+        except KeyboardInterrupt:
+            s.close()
