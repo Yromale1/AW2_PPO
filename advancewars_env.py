@@ -43,68 +43,28 @@ ARMY_COLORS = {
     3: (255, 255, 0),
 }
 
-LOSSES_NAMES = [
-    "nb_apc_lost",
-    "nb_artlry_lost",
-    "nb_infantry_lost",
-    "nb_md_tank_lost",
-    "nb_mech_lost",
-    "nb_missiles_lost",
-    "nb_recon_lost",
-    "nb_rockets_lost",
-    "nb_sub_lost",
-    "nb_t_cptr_lost",
-    "nb_tank_lost",
+UNITS_COST = [
+    1000,
+    3000,
+    4000,
+    7000,
+    16000,
+    22000,
+    5000,
+    6000,
+    15000,
+    8000,
+    12000,
+    20000,
+    22000,
+    9000,
+    5000,
+    28000,
+    18000,
+    12000,
+    20000
 ]
 
-BUILDS_NAMES = [
-    "nb_apc",
-    "nb_artlry",
-    "nb_infantry",
-    "nb_md_tank",
-    "nb_mech",
-    "nb_missiles",
-    "nb_recon",
-    "nb_rockets",
-    "nb_sub",
-    "nb_t_cptr",
-    "nb_tank",
-]
-
-VS_LOSSES_NAMES = [
-    "vs_nb_apc_lost",
-    "vs_nb_artlry_lost",
-    "vs_nb_infantry_lost",
-    "vs_nb_md_tank_lost",
-    "vs_nb_mech_lost",
-    "vs_nb_missiles_lost",
-    "vs_nb_recon_lost",
-    "vs_nb_rockets_lost",
-    "vs_nb_sub_lost",
-    "vs_nb_t_cptr_lost",
-    "vs_nb_tank_lost",
-]
-
-VS_BUILDS_NAMES = [
-    "vs_nb_apc",
-    "vs_nb_artlry",
-    "vs_nb_infantry",
-    "vs_nb_md_tank",
-    "vs_nb_mech",
-    "vs_nb_missiles",
-    "vs_nb_recon",
-    "vs_nb_rockets",
-    "vs_nb_sub",
-    "vs_nb_t_cptr",
-    "vs_nb_tank",
-]
-
-FACILITIES_NAMES = [
-    "cities",
-    "factories",
-    "ports",
-    "airports",
-]
 with open("./data/data.json", "r") as file:
     INFO_DICT = json.load(file)
 
@@ -203,16 +163,21 @@ class AdvanceWarsEnv:
         self.ewram = torch.zeros(0x40000)
         self.iwram = torch.zeros(0x8000)
         self.info = {}
+        self.old_info = None
 
         self.fog_mask = None
 
         self.units_p1 = []
         self.units_p1_count = {}
-        # self.units_p1_count_lost = {}
+        self.old_units_p1 = []
+        self.old_units_p1_count = {}
 
         self.units_p2 = []
         self.units_p2_count = {}
-        # self.units_p2_count_lost = {}
+        self.old_units_p2 = []
+        self.old_units_p2_count = {}
+
+        self.turn_steps = 0.0
 
         # -----------------------------
         # Initialize Matplotlib figure
@@ -246,29 +211,6 @@ class AdvanceWarsEnv:
         self.fig.canvas.draw_idle()
         plt.pause(0.01)
 
-        self.funds = self.info.get("funds", 0)
-
-        # Initialize dicts to calculate rewards
-        self.losses = {}
-        for loss_name in LOSSES_NAMES:
-            self.losses[loss_name] = 0
-
-        self.builds = {}
-        for build_name in BUILDS_NAMES:
-            self.builds[build_name] = self.info.get(build_name, 0)
-
-        self.facilities = {}
-        for facility_name in FACILITIES_NAMES:
-            self.facilities[facility_name] = self.info.get(facility_name, 0)
-
-        self.vs_losses = {}
-        for vs_loss_name in VS_LOSSES_NAMES:
-            self.vs_losses[vs_loss_name] = self.info.get(vs_loss_name, 0)
-
-        self.units_p1 = None
-
-        self.turn_steps = 0.0
-
     def reset(self):
         reset_sig = "RESET".encode(encoding="utf-8")
         print(reset_sig)
@@ -284,7 +226,10 @@ class AdvanceWarsEnv:
         map_grid = self.encode_map(self.terrain, self.fog_mask)
         units_grid = self.make_units_grid(self.units_p1, self.units_p2)
 
-        extras = np.array([self.info.get("funds",0)], dtype=np.float32)
+        extras = np.array([self.info.get("funds",0), self.info.get("cursor_x", 0), self.info.get("cursor_y", 0), self.info.get("cities", 0),
+                           self.info.get("factories", 0), self.info.get("nb_units", 0), self.info.get("nb_units_lost", 0), self.info.get("vs_nb_units", 0),
+                           self.info.get("vs_nb_units_lost", 0), self.info.get("map_width", 0), self.info.get("map_height", 0), self.info.get("day", 0)]
+                           , dtype=np.float32)
 
         obs = {
             "map": map_grid,
@@ -407,6 +352,7 @@ class AdvanceWarsEnv:
         return tiles
 
     def update_info(self):
+        self.old_info = self.info
         for k, v in INFO_DICT.items():
             address = v["address"]
             size = v["size"]
@@ -439,6 +385,8 @@ class AdvanceWarsEnv:
         # Read units for player 1
         # -----------------------------
         units_p1 = []
+        self.old_units_p1 = self.units_p1
+        self.old_units_p1_count = self.units_p1_count
         self.units_p1_count = {k: 0 for k in range(1,20)}  # Regroup units by ID
         unit = read_unit_from_info(self.ewram, self.iwram, UNIT_P1)
         unit['ai'] = 0
@@ -456,7 +404,11 @@ class AdvanceWarsEnv:
         # Read units for player 2
         # -----------------------------
         units_p2 = []
+        self.old_units_p2 = self.units_p2
+        self.old_units_p2_count = self.units_p2_count
         self.units_p2_count = {k: 0 for k in range(1,20)}  # Regroup units by ID
+        self.old_units_p1 = self.units_p2
+        self.old_units_p1_count = self.units_p2_count
         unit = read_unit_from_info(self.ewram, self.iwram, UNIT_P2)
         unit['ai'] = 1
         index = 0
@@ -540,41 +492,26 @@ class AdvanceWarsEnv:
     def calculatereward(self, info, units_p1):
         reward = 0.0
 
-        # funds = info.get("funds", 0)
-        # reward += np.abs(self.funds - funds) / 1000.0
+        funds = self.info.get("funds", 0)
+        old_funds = self.old_info.get("funds", 0)
+        reward += np.abs(funds - old_funds) / 10000.0
 
-        day = info.get("day", 0)
+        cities = self.info.get("cities", 0)
+        old_cities = self.old_info.get("cities", 0)
+        reward += np.abs(cities - old_cities)
+
+        factories = self.info.get("factories", 0)
+        old_factories = self.old_info.get("factories", 0)
+        reward += np.abs(factories - old_factories)
+
+        day = self.info.get("day", 0)
         reward -= day * 0.5
 
-        for loss_name in LOSSES_NAMES:
-            loss = info.get(loss_name, 0)
-            reward -= (loss - self.losses[loss_name]) * 2.0
-            self.losses[loss_name] = loss
+        for k, v in self.units_p1_count.items():
+            reward += (v - self.old_units_p1_count.get(k, 0)) * UNITS_COST[k] / 10000.0
 
-        for build_name in BUILDS_NAMES:
-            build = info.get(build_name, 0)
-            reward += (build - self.builds[build_name]) * 3.0
-            self.builds[build_name] = build
-
-        for facility_name in FACILITIES_NAMES:
-            facility = info.get(facility_name, 0)
-            reward += (facility - self.facilities[facility_name]) * 2.0
-            self.facilities[facility_name] = facility
-
-        for vs_loss_name in VS_LOSSES_NAMES:
-            vs_loss = info.get(vs_loss_name, 0)
-            reward += (vs_loss - self.vs_losses[vs_loss_name]) * 5.0
-            self.vs_losses[vs_loss_name] = vs_loss
-
-        for idx, unit in enumerate(units_p1):
-            if idx > len(self.units_p1):
-                self.units_p1.append(unit)
-            elif unit["moved"] != self.units_p1[idx]["moved"]:
-                if unit["moved"] == 1:
-                    reward += 1.0
-                elif unit["moved"] == 6:
-                    reward += 0.05
-                self.units_p1[idx] = unit
+        for k, v in self.units_p2_count.items():
+            reward += min(v - self.old_units_p1_count.get(k, 0), 0) * UNITS_COST[k] / 10000.0
 
         reward -= self.turn_steps * 0.005
 
@@ -637,7 +574,6 @@ class AdvanceWarsEnv:
             action = action.numpy().tobytes()
         self.send_and_receive(action)
         self.update_info()
-        print(self.info)
         self.render()
         if self.info.get("turn", 0) != 1:
             self.turn_steps = 0.0
@@ -652,9 +588,6 @@ class AdvanceWarsEnv:
             self.update_info()
             self.render()
             time.sleep(2)
-
-        if self.info.get("menu", 0) == 0 or self.info.get("win", 0) == 1:
-            done = True
 
         fog_mask, units_p1, units_p2 = self.fog_mask, self.units_p1, self.units_p2
         terrain = self.terrain
@@ -678,6 +611,8 @@ class AdvanceWarsEnv:
         elapsed = time.time() - start
         if elapsed <  elapsed:
             time.sleep(frame_duration - elapsed)
+
+        self.turn_steps += 1.0
 
         return obs, reward, done, self.info
 
