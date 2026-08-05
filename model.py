@@ -25,7 +25,7 @@ class PolicyNet(torch.nn.Module):
         conv_out_dim = 64 * 5 * 5
 
         # Optional: extra scalar features (e.g. funds, turn, CO id, etc.)
-        self.extra_fc = nn.Linear(1, 32)  # adjust if you add extra feats
+        self.extra_fc = nn.Linear(12, 32)
 
         # Merge map + extras
         self.fc = nn.Sequential(
