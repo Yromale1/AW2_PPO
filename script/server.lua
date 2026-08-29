@@ -35,9 +35,55 @@ local function pack_uint32_be(n)
     return string.char(b1, b2, b3, b4)
 end
 
+local pending_send = nil
+local pending_pos = 1
+
+local function queue_send(data)
+    if pending_send ~= nil then
+        console:error("Send already pending")
+        return false
+    end
+
+    pending_send = data
+    pending_pos = 1
+    return true
+end
+
+local function flush_send()
+    if pending_send == nil then
+        return true
+    end
+
+    local last, err = sock:send(
+        pending_send,
+        pending_pos,
+        #pending_send
+    )
+
+    if last then
+        pending_pos = last + 1
+
+        if pending_pos > #pending_send then
+            pending_send = nil
+            pending_pos = 1
+            return true
+        end
+
+        return false
+    end
+
+    if err == socket.ERRORS.AGAIN then
+        -- Socket is temporarily unable to accept more data.
+        -- Keep pending_send and try again later.
+        return false
+    end
+
+    error("Socket send failed: " .. tostring(err))
+end
+
 local function send_message(payload, frame)
     local header = pack_uint32_be(#payload) .. pack_uint32_be(frame)
-    sock:send(header .. payload)
+    queue_send(header .. payload)
 end
 
 local function busy_wait(n)
@@ -79,46 +125,149 @@ local function tensor_to_bitmask(data)
     return mask
 end
 
-local function receive_and_send(frame)
+local MSG_ACTION = 0
+local MSG_RESET  = 1
 
-    if sock:hasdata() then
-        local msg, err = sock:receive(4096)
-        local success, result = pcall(string.unpack, "s4", msg)
-        if success and result == "RESET" then
-            console:log("RESET")
-            emu:loadStateFile("/home/yro/code/rom/AW2.ss2")
-        else
-            local mask = tensor_to_bitmask(unpack_floats(msg))
-            msg = tensor_to_string(unpack_floats(msg))
-            if msg then
-                console:log("[From Python] " .. msg)
-                emu:setKeys(mask)
-                console:log(keysToString(emu:getKeys()))
-            elseif err and err ~= socket.ERRORS.WOULD_BLOCK then
-                console:error("Socket receive error: " .. tostring(err))
+local recv_buffer = ""
+
+local function unpack_uint32_be(data, pos)
+    local b1, b2, b3, b4 = string.byte(data, pos, pos + 3)
+
+    return b1 * 2^24 +
+           b2 * 2^16 +
+           b3 * 2^8 +
+           b4
+end
+
+local function receive_messages()
+    while sock:hasdata() do
+        local chunk, err = sock:receive(4096)
+
+        if not chunk then
+            if err == socket.ERRORS.WOULD_BLOCK then
                 return
             end
-            -- Send memory snapshot
-            local ewram = emu:readRange(0x02000000, 0x40000)
-            local iwram = emu:readRange(0x03000000, 0x8000)
-            local payload = ewram .. iwram
-            send_message(payload, frame)
+
+            console:error("Socket receive error: " .. tostring(err))
+            return
+        end
+
+        recv_buffer = recv_buffer .. chunk
+    end
+end
+
+local function get_message()
+    -- Not enough data for header
+    if #recv_buffer < 8 then
+        return nil
+    end
+
+    local length = unpack_uint32_be(recv_buffer, 1)
+    local message_type = unpack_uint32_be(recv_buffer, 5)
+
+    -- Don't have complete payload yet
+    if #recv_buffer < 8 + length then
+        return nil
+    end
+
+    local payload = ""
+
+    if length > 0 then
+        payload = string.sub(recv_buffer, 9, 8 + length)
+    end
+
+    -- Remove consumed message from buffer
+    recv_buffer = string.sub(recv_buffer, 9 + length)
+
+    return message_type, payload
+end
+
+
+local function receive_and_send(frame)
+
+    -- Read whatever TCP data is currently available
+    receive_messages()
+
+    local message_type, msg = get_message()
+
+    if not message_type then
+        return nil
+    end
+
+    if message_type == MSG_RESET then
+        console:log("RESET")
+
+        emu:loadStateFile(
+            "/home/yro/code/rom/AW2.ss5"
+        )
+
+        return nil
+    end
+
+    if message_type == MSG_ACTION then
+        local values = unpack_floats(msg)
+
+        local mask = tensor_to_bitmask(values)
+        local msg_string = tensor_to_string(values)
+
+        console:log("[From Python] " .. msg_string)
+
+        emu:setKeys(mask)
+
+        console:log(
+            keysToString(emu:getKeys())
+        )
+
+        -- A breakpoint triggered while processing this action.
+        -- Its result is the response to THIS input.
+        if terminal_frame ~= nil then
+            send_message(terminal_payload, terminal_frame)
+
+            -- Consume the terminal event so it cannot be sent again.
+            terminal_frame = nil
+            terminal_payload = nil
+
             return mask
         end
+
+        -- Send memory snapshot
+        local ewram = emu:readRange(
+            0x02000000,
+            0x40000
+        )
+
+        local iwram = emu:readRange(
+            0x03000000,
+            0x8000
+        )
+
+        local payload = ewram .. iwram
+
+        send_message(payload, frame)
+
+        return mask
     end
+
+    console:error(
+        "Unknown message type: " .. tostring(message_type)
+    )
+
     return nil
 end
 
+local terminal_frame = nil
+local terminal_payload = nil
+
 -- Win routine tracking
-local WIN_ROUTINE = 0x0803861D
+local WIN_ROUTINE = 0x0803861C
 local WIN_FRAME = 0xFFFFFFFF
 
 local end_bp = emu:setBreakpoint(function(addr)
     local winner = emu:readRegister("r0")
+
     if winner ~= 0 then
-        local msg = string.format("Player %d won", winner)
-        send_message(msg, WIN_FRAME)
-        last_winner = winner
+        terminal_frame = WIN_FRAME
+        terminal_payload = string.format("Player %d won", winner)
     end
 end, WIN_ROUTINE)
 
@@ -126,9 +275,8 @@ local EXIT_ROUTINE = 0x080185C8
 local EXIT_FRAME = 0x11111111
 
 local exit_bp = emu:setBreakpoint(function(addr)
-    local msg = "Exit map triggered"
-    send_message(msg, EXIT_FRAME)
-    console:log(msg)
+    terminal_frame = EXIT_FRAME
+    terminal_payload = "Exit map triggered"
 end, EXIT_ROUTINE)
 
 -- === Frame variables ===
@@ -149,5 +297,6 @@ callbacks:add("frame", function()
 
         
     end
+    flush_send()
     
 end)

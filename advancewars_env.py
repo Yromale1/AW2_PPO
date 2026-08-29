@@ -65,6 +65,11 @@ UNITS_COST = [
     20000
 ]
 
+WIN_FRAME = 0xFFFFFFFF  # Special frame indicating a win message
+EXIT_FRAME = 0x11111111  # Special frame indicating an exit message
+MSG_ACTION = 0
+MSG_RESET = 1
+
 with open("./data/data.json", "r") as file:
     INFO_DICT = json.load(file)
 
@@ -178,6 +183,7 @@ class AdvanceWarsEnv:
         self.old_units_p2_count = {}
 
         self.turn_steps = 0.0
+        self.point = 0.0
 
         # -----------------------------
         # Initialize Matplotlib figure
@@ -212,15 +218,30 @@ class AdvanceWarsEnv:
         plt.pause(0.01)
 
     def reset(self):
-        reset_sig = "RESET".encode(encoding="utf-8")
-        print(reset_sig)
-        self.conn.send(reset_sig)
+        self.send_message(b"", MSG_RESET)
         time.sleep(1)  # Sleep a bit for at least 1 frame to pass
         action = torch.zeros(10, dtype=torch.float32)
         action = action.numpy().tobytes()
+        if len(self.reward_history) > 1024:
+            self.reward_history = [0.0]
+            self.turn_steps = 0.0
+            self.point = 0.0
+
+        self.info = {}
+        self.old_info = None
+
+        self.units_p1 = []
+        self.units_p1_count = {}
+        self.old_units_p1 = []
+        self.old_units_p1_count = {}
+
+        self.units_p2 = []
+        self.units_p2_count = {}
+        self.old_units_p2 = []
+        self.old_units_p2_count = {}
+
         self.send_and_receive(action)
         self.update_info()
-        self.reward_history = [0.0]
         self.render()
 
         map_grid = self.encode_map(self.terrain, self.fog_mask)
@@ -238,14 +259,15 @@ class AdvanceWarsEnv:
         }
         return obs, self.info
 
-    def read_map(self, height, width, ewram, iwram):
+    def read_map(self, ewram, iwram):
         # -----------------------------
         # Read tiles and fog
         # -----------------------------
-        tiles = np.zeros((20, 30), dtype=np.uint8)
+        map_height, map_width = self.info.get("map_height", 0), self.info.get("map_width", 0)
+        tiles = np.zeros((self.height, self.width), dtype=np.uint8)
         addr = INFO_DICT["map"]["address"]
-        for y in range(height):
-            for x in range(width):
+        for y in range(min(map_height, self.height)):
+            for x in range(min(map_width, self.width)):
                 b = read_bytes_from_memory(addr, 2, ewram, iwram)
                 if b:
                     # 1st byte
@@ -363,18 +385,13 @@ class AdvanceWarsEnv:
     def extract_state(self):
         """Extract map tiles, fog mask, and units from memory blocks."""
 
-        # -----------------------------
-        # Read map dimensions
-        # -----------------------------
-        width = self.info["map_width"]
-        height = self.info["map_height"]
+        self.terrain = self.read_map(self.ewram, self.iwram)
+        map_height, map_width = self.info.get("map_height", 0), self.info.get("map_width", 0)
 
-        self.terrain = self.read_map(height, width, self.ewram, self.iwram)
-
-        fog_mask = np.zeros((20, 30), dtype=np.uint8)
+        fog_mask = np.zeros((self.height, self.width), dtype=np.uint8)
         fog_addr = FOG_ADDR
-        for y in range(height):
-            for x in range(width):
+        for y in range(min(map_height, self.height)):
+            for x in range(min(map_width, self.width)):
                 f = read_bytes_from_memory(fog_addr,1, self.ewram, self.iwram)
                 if f:
                     fog_mask[y, x] =  1 if f[0] > 0 else 0
@@ -385,14 +402,15 @@ class AdvanceWarsEnv:
         # Read units for player 1
         # -----------------------------
         units_p1 = []
-        self.old_units_p1 = self.units_p1
-        self.old_units_p1_count = self.units_p1_count
+        if self.info.get("turn", 0) != 3:
+            self.old_units_p1 = self.units_p1
+            self.old_units_p1_count = self.units_p1_count
         self.units_p1_count = {k: 0 for k in range(1,20)}  # Regroup units by ID
         unit = read_unit_from_info(self.ewram, self.iwram, UNIT_P1)
         unit['ai'] = 0
         index = 0
         while UNIT_P1 + index * 12 < UNIT_P2:  # 12 -> Size of unit in memory
-            if unit["id"] != 0:
+            if unit["id"] > 0:
                 units_p1.append({**unit})
                 self.units_p1_count[unit["id"]] += 1
             index += 1
@@ -404,16 +422,15 @@ class AdvanceWarsEnv:
         # Read units for player 2
         # -----------------------------
         units_p2 = []
-        self.old_units_p2 = self.units_p2
-        self.old_units_p2_count = self.units_p2_count
+        if self.info.get("turn", 0) != 3:
+            self.old_units_p2 = self.units_p2
+            self.old_units_p2_count = self.units_p2_count
         self.units_p2_count = {k: 0 for k in range(1,20)}  # Regroup units by ID
-        self.old_units_p1 = self.units_p2
-        self.old_units_p1_count = self.units_p2_count
         unit = read_unit_from_info(self.ewram, self.iwram, UNIT_P2)
         unit['ai'] = 1
         index = 0
         while UNIT_P2 + index * 12 < UNIT_P2 + 512:  # 512 -> Total bytes for a player's units
-            if unit["id"] != 0:
+            if unit["id"] > 0:
                 units_p2.append({**unit})
                 self.units_p2_count[unit["id"]] += 1
             index += 1
@@ -435,21 +452,19 @@ class AdvanceWarsEnv:
         fog_mask, units_p1, units_p2 = self.fog_mask, self.units_p1, self.units_p2
         tiles = self.terrain
 
-        # Update terrain, fog, units (same as before)
-        height, width = tiles.shape
-        terrain = np.zeros((20, 30, 3), dtype=np.uint8)
-        fog = np.zeros((20, 30, 3), dtype=np.uint8)
-        units_map = np.zeros((20, 30, 3), dtype=np.uint8)
+        terrain = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        fog = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        units_map = np.zeros((self.height, self.width, 3), dtype=np.uint8)
 
-        for y in range(height):
-            for x in range(width):
+        for y in range(self.height):
+            for x in range(self.width):
                 terrain[y, x] = TERRAIN_COLORS.get(tiles[y, x], (150, 150, 150))
                 fog[y, x] = (255, 255, 255) if fog_mask[y, x] else (0, 0, 0)
 
         for u in units_p1 + units_p2:
             px, py = u["x"], u["y"]
-            if 0 <= px < width and 0 <= py < height:
-                units_map[py, px] = ARMY_COLORS.get(u["ai"], (255, 255, 255))
+            if 0 <= px < self.width and 0 <= py < self.height:
+                units_map[py, px] = ARMY_COLORS.get(u["ai"], (255, 255, 255)) if fog_mask[py, px] else (0, 0, 0)
 
         self.terrain_img.set_data(terrain)
         self.fog_img.set_data(fog)
@@ -474,7 +489,8 @@ class AdvanceWarsEnv:
         plt.pause(0.001)
 
     def make_units_grid(self, units_p1, units_p2):
-        grid = np.zeros((20, 30), dtype=np.int32)
+
+        grid = np.zeros((self.height, self.width), dtype=np.int32)
         for u1 in units_p1:
             if u1['hp'] <= 0:
                 continue
@@ -489,43 +505,64 @@ class AdvanceWarsEnv:
             grid[u2['y'], u2['x']] = code
         return grid
 
-    def calculatereward(self, info, units_p1):
+    def calculatereward(self):
         reward = 0.0
 
         funds = self.info.get("funds", 0)
         old_funds = self.old_info.get("funds", 0)
-        reward += np.abs(funds - old_funds) / 10000.0
+        reward += np.abs(funds - old_funds) / 10000.0 + 0.0
 
         cities = self.info.get("cities", 0)
         old_cities = self.old_info.get("cities", 0)
-        reward += np.abs(cities - old_cities)
+        reward += np.abs(cities - old_cities) + 0.0
 
         factories = self.info.get("factories", 0)
         old_factories = self.old_info.get("factories", 0)
-        reward += np.abs(factories - old_factories)
+        reward += np.abs(factories - old_factories) + 0.0
 
         day = self.info.get("day", 0)
         reward -= day * 0.5
 
-        for k, v in self.units_p1_count.items():
-            reward += (v - self.old_units_p1_count.get(k, 0)) * UNITS_COST[k] / 10000.0
+        for unit in self.units_p1:
+            if unit["moved"] == 6:  # Moving
+                reward += 0.1
+            if unit["moved"] == 1:  # Moved
+                reward += 1.0
 
-        for k, v in self.units_p2_count.items():
-            reward += min(v - self.old_units_p1_count.get(k, 0), 0) * UNITS_COST[k] / 10000.0
+        if self.old_units_p1_count:
+            for k, v in self.units_p1_count.items():
+                reward += (v - self.old_units_p1_count.get(k, 0)) * UNITS_COST[k - 1] / 10000.0
+
+        if self.old_units_p2_count:
+            for k, v in self.units_p2_count.items():
+                reward += min(v - self.old_units_p2_count.get(k, 0), 0) * UNITS_COST[k - 1] / 10000.0
 
         reward -= self.turn_steps * 0.005
 
-        if info.get("win", 0) == 1:
-            reward += 100.0
+        reward += self.point
+        self.point = 0.0
 
         return reward
 
     def check_win(self):
         if len(self.units_p1) == 0:
             return False
+
+    def adjust_action(self, action):
+        res = torch.zeros(10, dtype=torch.float32)
+        if action >= 1:
+            action += 1  # No R (position 1)
+        if action >= 6:
+            action += 2  # No start or select (position 6 and 7)
+        res[action] = 1.0
+        return res.numpy().tobytes()
+
+    def send_message(self, payload, message_type=0):
+        header = struct.pack(">II", len(payload), message_type)
+        self.conn.sendall(header + payload)
         
     def send_and_receive(self, action):
-        self.conn.send(action)
+        self.send_message(action, MSG_ACTION)
         # Receive 8-byte header
         header = recv_exact(self.conn, 8)
         if not header:
@@ -539,23 +576,20 @@ class AdvanceWarsEnv:
         if frame == WIN_FRAME:
             # This is a win message
             try:
-                msg = data.decode("ascii")
-                print(msg)
+                self.point = 50.0
                 self.reset()
             except UnicodeDecodeError:
                 return "[WIN] Unable to decode message"
         elif frame == EXIT_FRAME:
             # This is an exit message
             try:
-                msg = data.decode("ascii")
-                print(msg)
+                self.point = -50.0
                 self.reset()
             except UnicodeDecodeError:
                 return "[EXIT] Unable to decode message"
         else:
-            print("mem snapshot")
             # This is a memory snapshot
-            mem = mem = np.frombuffer(data, dtype=np.uint8)
+            mem = np.frombuffer(data, dtype=np.uint8)
             tensor = torch.from_numpy(mem)
 
             self.ewram = tensor[:0x40000]
@@ -572,30 +606,33 @@ class AdvanceWarsEnv:
                 pos = np.random.randint(10)
             action[pos] = 1.0
             action = action.numpy().tobytes()
+        else:
+            action = self.adjust_action(action)
         self.send_and_receive(action)
         self.update_info()
         self.render()
-        if self.info.get("turn", 0) != 1:
+        if self.info.get("turn", 0) != 3:
             self.turn_steps = 0.0
         else:
             self.turn_steps += 1.0
-        while self.info.get("turn", -1) != 1:
-            if self.info.get("finish", 0) == 5:
-                done = True
+        while self.info.get("turn", -1) != 3:
             action_start = torch.zeros(10, dtype=torch.float32)
             action_start = action_start.numpy().tobytes()
             self.send_and_receive(action_start)
             self.update_info()
             self.render()
-            time.sleep(2)
+            if self.info.get("defeat", 0) != 0:  
+                self.send_message(b"", MSG_RESET)
+                time.sleep(1) 
+                self.point -= 50.0
 
-        fog_mask, units_p1, units_p2 = self.fog_mask, self.units_p1, self.units_p2
-        terrain = self.terrain
+        map_grid = self.encode_map(self.terrain, self.fog_mask)
+        units_grid = self.make_units_grid(self.units_p1, self.units_p2)
 
-        map_grid = self.encode_map(terrain, fog_mask)
-        units_grid = self.make_units_grid(units_p1, units_p2)
-
-        extras = np.array([self.info.get("funds",0)], dtype=np.float32)
+        extras = np.array([self.info.get("funds",0), self.info.get("cursor_x", 0), self.info.get("cursor_y", 0), self.info.get("cities", 0),
+                            self.info.get("factories", 0), self.info.get("nb_units", 0), self.info.get("nb_units_lost", 0), self.info.get("vs_nb_units", 0),
+                            self.info.get("vs_nb_units_lost", 0), self.info.get("map_width", 0), self.info.get("map_height", 0), self.info.get("day", 0)]
+                            , dtype=np.float32)
 
         obs = {
             "map": map_grid,
@@ -603,16 +640,14 @@ class AdvanceWarsEnv:
             "extras": extras
         }
 
-        reward = self.calculatereward(self.info, units_p1)
+        reward = self.calculatereward()
 
         self.reward_history.append(reward)
 
         frame_duration = 1.0 / 25.0
         elapsed = time.time() - start
-        if elapsed <  elapsed:
+        if elapsed < frame_duration:
             time.sleep(frame_duration - elapsed)
-
-        self.turn_steps += 1.0
 
         return obs, reward, done, self.info
 
@@ -626,25 +661,21 @@ class AdvanceWarsEnv:
 # USAGE EXAMPLE
 # -----------------------------
 HOST, PORT = "127.0.0.1", 5000
-WIN_FRAME = 0xFFFFFFFF  # Special frame indicating a win message
-EXIT_FRAME = 0x11111111
 
 def recv_exact(sock, size):
-    buf = b""
+    buf = bytearray()
 
     while len(buf) < size:
-        try:
-            data = sock.recv(size - len(buf))
-        except BlockingIOError:
-            # No more data available right now.
-            return None
+        data = sock.recv(size - len(buf))
 
         if not data:
-            return None  # Connection closed
+            raise ConnectionError(
+                f"Connection closed: received {len(buf)}/{size} bytes"
+            )
 
-        buf += data
+        buf.extend(data)
 
-    return buf
+    return bytes(buf)
 
 if __name__ == "__main__":
     env = AdvanceWarsEnv()
@@ -655,13 +686,11 @@ if __name__ == "__main__":
             s.listen(1)
             print(f"Listening on {HOST}:{PORT}...")
             conn, addr = s.accept()
-            conn.setblocking(False)
             print(f"Connected by {addr}")
 
             with conn:
                 env.conn = conn
                 while env:
-                    env.close()
                     env.step()
             env.close()
         except KeyboardInterrupt:
