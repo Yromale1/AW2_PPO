@@ -3,3 +3,5 @@
 *.ss*
 mgba
 __pycache__
+*test*
+*.pt
