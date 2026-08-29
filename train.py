@@ -5,8 +5,11 @@ import torch.optim as optim
 from collections import namedtuple
 from advancewars_env import AdvanceWarsEnv
 from model import PolicyNet
+import subprocess
+import time
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(device)
 
 # -----------------------------
 # Observation preprocessing
@@ -49,13 +52,11 @@ class PPOTrainer:
     # -----------------------------
     # Collect trajectories
     # -----------------------------
-    def collect_trajectories(self, horizon=128, render=False):
+    def collect_trajectories(self, horizon=128):
         obs_list, actions_list, logp_list, rewards_list, dones_list, values_list = [], [], [], [], [], []
 
         obs, info = self.env.reset()
         for t in range(horizon):
-            if render:
-                self.env.render()
 
             map_grid, unit_grid, extras = preprocess_obs(obs)
             action_np, log_prob, entropy, value = self.model.get_action_and_value(
@@ -125,7 +126,7 @@ class PPOTrainer:
 
         batch_size = b_actions.shape[0]
 
-        for epoch in range(self.epochs):
+        for _ in range(self.epochs):
             indices = np.random.permutation(batch_size)
             for start in range(0, batch_size, self.minibatch_size):
                 mb_idx = indices[start:start + self.minibatch_size]
@@ -158,14 +159,70 @@ class PPOTrainer:
         return policy_loss.item(), value_loss.item(), entropy_loss.item()
 
 # -----------------------------
-# Training example
+# Training
 # -----------------------------
+HOST, PORT = "127.0.0.1", 5000
+
+def recv_exact(sock, size):
+    buf = b""
+
+    while len(buf) < size:
+        try:
+            data = sock.recv(size - len(buf))
+        except BlockingIOError:
+            # No more data available right now.
+            return None
+
+        if not data:
+            return None  # Connection closed
+
+        buf += data
+
+    return buf
 env = AdvanceWarsEnv()
-action_dim = env.wrapped.action_space.n  # discrete actions
+action_dim = 7  # discrete actions
 policy = PolicyNet(action_dim)
 trainer = PPOTrainer(policy, env)
 
-for update in range(1000):
-    rollout = trainer.collect_trajectories(horizon=10192, render=True)
-    p_loss, v_loss, e_loss = trainer.update(rollout)
-    print(f"Update {update}: Policy {p_loss:.3f}, Value {v_loss:.3f}, Entropy {e_loss:.3f}")
+with env.socket as s:
+    # try:
+        s.bind((HOST, PORT))
+        s.listen(1)
+        print(f"Listening on {HOST}:{PORT}...")
+
+        process = subprocess.Popen(
+            ["./mgba/build/qt/mgba-qt", "./rom/AW2.gba", "-t", "./rom/AW2.ss5", "--script", "./script/server.lua"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        conn, addr = s.accept()
+        print(f"Connected by {addr}")
+        env.conn = conn
+
+        if process.poll() is None:
+            for update in range(1000):
+                rollout = trainer.collect_trajectories(horizon=1024)
+                p_loss, v_loss, e_loss = trainer.update(rollout)
+                print(f"Update {update}: Policy {p_loss:.3f}, Value {v_loss:.3f}, Entropy {e_loss:.3f}")
+                if update % 100 == 0 and update != 0:
+                    checkpoint = {
+                        "model_state_dict": policy.state_dict(),
+                        "optimizer_state_dict": trainer.optimizer.state_dict(),
+                        "update": update,
+                        "action_dim": action_dim,
+                    }
+                    torch.save(checkpoint, f"./model/policy_net_{update}.pt")
+        else:
+            env.close()
+
+    # except KeyboardInterrupt:
+    #     process.terminate()
+    #     env.close()
+    # except Exception:
+    #     process.terminate()
+    #     env.close()
+
+    # except:
+    #     pass
